@@ -1,0 +1,13 @@
+{
+  "env": { "browser": true, "es2021": true },
+  "parserOptions": { "ecmaVersion": 2021, "sourceType": "script" },
+  "globals": {
+    "XLSX": "readonly",
+    "html2canvas": "readonly",
+    "Chart": "readonly",
+    "L": "readonly"
+  },
+  "rules": {
+    "no-undef": "error"
+  }
+}
