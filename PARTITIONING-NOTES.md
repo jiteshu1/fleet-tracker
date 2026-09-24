@@ -128,3 +128,41 @@ This is now part of the standard test run before every future change ships,
 not just a syntax check.
 
 55/55 functional tests + the new lint check, all passing.
+
+## Live-data investigation (this round) — confirmed data was never lost
+User reported the live app showing "everything already loaded" for older
+months and an export missing everything except the current month, right
+after a chaotic period of deleting/recreating the GitHub repo and Cloudflare
+Pages project and deploying via a cmd-line workaround.
+
+Pulled the actual Supabase `app_data` table contents and reproduced the
+exact scenario (real trip records already sitting in `trips_2025-04`,
+`trips_2026-04`, `trips_2026-06`, `trips_2026-07`, `trips_2026-09`) against
+the current code: fiscal-year prefetch correctly picked up every one of
+them. **The partitioning/loading logic itself was never the problem** —
+the data was intact the whole time. The live site was very likely still
+running an earlier deploy from the messy migration period. Once the user
+redeployed with the latest zip, the data appeared automatically.
+
+## Fleet Dispatch: date range now actually filters the table (real bug, now fixed)
+Reported separately: picking a date range only affected the Excel export —
+the on-screen table kept showing everything regardless of the dates picked.
+Fixed: the same date range now filters what's shown on screen too, using
+the existing `inDateRange()` (which already gracefully handles just one
+side of the range being set). 5 new tests lock this in.
+
+## Fleet Dispatch layout — full redesign per the user's own detailed spec
+Rebuilt the top of the Fleet Dispatch page into one compact, single-row
+toolbar: Add trip, Company, Manager, Search, Date range, Clear, Export —
+laid out together, wrapping sensibly on narrow screens, instead of several
+stacked full-width blocks. Reused the app's existing `.ofl-filter-bar`
+style (same one already used on the other dashboards) rather than
+inventing new styling — no colors/theme/sidebar/header/table structure/
+button behavior changed, only how compactly these controls are arranged.
+The secondary toolbar (Upload your data / Full screen / Export JPG /
+Export to Excel) and the table itself are untouched. Scoped to Fleet
+Dispatch only, as asked — RTGS and Expenses screens weren't touched this
+round.
+
+60/60 tests passing (20 backend + 12 client-server e2e + 6 login + 7 nav +
+6 date-input + 4 layout + 5 dispatch-filter), plus the no-undef lint check.
