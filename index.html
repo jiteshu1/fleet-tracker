@@ -1087,6 +1087,68 @@
     else{ goHome(); }
   }
 
+  // ---------------------------------------------------------------------
+  // SESSION PERSISTENCE (survives a page refresh) — and why logout must do
+  // a full reload, not a partial reset
+  // ---------------------------------------------------------------------
+  // Previously the session token lived only in the `authToken` JS variable,
+  // never in localStorage. That meant any page refresh threw the session
+  // away and forced a full re-login — which in turn meant the natural way
+  // to "start fresh" while testing was to log out and log back in inside
+  // the SAME browser tab, without ever refreshing. But the old logout()
+  // only cleared the session/stack — every other piece of in-memory state
+  // (state.trips, state.managers, which months were already loaded, the
+  // "load older data" status, etc.) was left exactly as it was. The next
+  // login then started from that stale leftover state instead of a clean
+  // one. That one gap explained four separate-looking reported bugs at
+  // once: a "load older data" status that never reset, an export/table
+  // that kept showing an old, incomplete set of trips, and — most
+  // seriously — adding a new manager appearing to delete every other
+  // manager (because the save's "incoming" list was built from a stale,
+  // incomplete state.managers left over from a previous session, and the
+  // scoped merge correctly treats "was in my baseline, isn't in what I'm
+  // sending" as a deletion).
+  //
+  // The fix: persist the token across refreshes (so refreshing no longer
+  // forces a re-login), and make logout() do a full page reload (so every
+  // piece of state — not just session/stack — is guaranteed to start
+  // clean for whoever logs in next, on the same device or a different
+  // one). The server independently re-validates the token's expiry on
+  // every single request regardless of any of this, so nothing here
+  // changes the actual security boundary — this is purely about avoiding
+  // stale client-side state.
+  var SESSION_STORAGE_KEY = "ft-session";
+
+  function decodeTokenPayload(token){
+    try{
+      var b64 = String(token).split(".")[0].replace(/-/g,"+").replace(/_/g,"/");
+      while(b64.length % 4) b64 += "=";
+      return JSON.parse(atob(b64));
+    }catch(e){ return null; }
+  }
+
+  function persistSession(token){
+    try{ localStorage.setItem(SESSION_STORAGE_KEY, token); }catch(e){}
+  }
+
+  function clearPersistedSession(){
+    try{ localStorage.removeItem(SESSION_STORAGE_KEY); }catch(e){}
+  }
+
+  // Returns {token, name, role} if a still-valid session is stored, else
+  // null (and clears anything stale/malformed it finds along the way).
+  function restoreSession(){
+    var token;
+    try{ token = localStorage.getItem(SESSION_STORAGE_KEY); }catch(e){ return null; }
+    if(!token) return null;
+    var payload = decodeTokenPayload(token);
+    if(!payload || typeof payload.exp!=="number" || payload.exp<Date.now() || !payload.name || !payload.role){
+      clearPersistedSession();
+      return null;
+    }
+    return {token:token, name:payload.name, role:payload.role};
+  }
+
   async function login(name, pass){
     var res;
     try{
@@ -1107,6 +1169,7 @@
       return;
     }
     authToken = body.token;
+    persistSession(authToken);
     state.session = {name: body.name, role: body.role};
     state.booted = false; // show the "Loading fleet data…" screen while we fetch, now that we're authenticated
     render();
@@ -1115,7 +1178,12 @@
     goHome();
   }
 
-  function logout(){ authToken = null; state.stack=[]; state.session=null; go("login", null, true); }
+  // A full page reload, not a partial state reset — see the big comment
+  // above restoreSession() for exactly why that matters here.
+  function logout(){
+    clearPersistedSession();
+    location.reload();
+  }
 
   function myTrucks(){
     return state.trucks.filter(function(t){ return t.driverName && t.driverName.toLowerCase()===state.session.name.toLowerCase(); });
@@ -6288,10 +6356,22 @@
   }
 
   // No data is fetched until after a successful login (the server won't
-  // hand any of it over without a valid session token) — so at boot we just
-  // show the login screen immediately, instead of loading data first.
-  state.booted = true;
-  render();
+  // hand any of it over without a valid session token) — so at boot we
+  // just show the login screen immediately, UNLESS a still-valid session
+  // was persisted from before (see restoreSession() above), in which case
+  // we resume straight into the app with a fresh loadAll() instead of
+  // making the person log in again on every refresh.
+  var resumed = restoreSession();
+  if(resumed){
+    authToken = resumed.token;
+    state.session = {name: resumed.name, role: resumed.role};
+    state.booted = false; // shows the "Loading fleet data…" screen while loadAll() runs
+    render();
+    loadAll().then(function(){ goHome(); });
+  } else {
+    state.booted = true;
+    render();
+  }
   applyTheme();
 
   // ---------- PWA: service worker + "Install app" support ----------

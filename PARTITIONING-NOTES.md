@@ -166,3 +166,39 @@ round.
 
 60/60 tests passing (20 backend + 12 client-server e2e + 6 login + 7 nav +
 6 date-input + 4 layout + 5 dispatch-filter), plus the no-undef lint check.
+
+## One root cause behind four separate-looking bugs (this round)
+Reported together: (1) "Load older data" status never resetting across
+logout/login, (2) the table/export only ever showing a small, stale set of
+trips no matter what date range was picked, (3) a page refresh forcing a
+full re-login, (4) — the serious one — adding a new manager appearing to
+delete every other manager and unassign their vehicles.
+
+**All four traced back to one thing.** The session token only ever lived in
+a JS variable, never saved anywhere — so any page refresh lost it and
+forced a fresh login (bug 3). That made refreshing painful, so the natural
+way to "start over" while testing became logging out and back in inside the
+*same browser tab*, without ever refreshing. But `logout()` only cleared
+the session — every other piece of in-memory state (which months were
+loaded, the trips already in memory, the managers list, etc.) was left
+exactly as it was from before. The next login then quietly built on top of
+that stale leftover state instead of a clean one:
+- Bug 1: the "load older data" status was never reset because nothing reset it.
+- Bug 2: the table/export only reflected whatever trips happened to still be in memory from the previous session, not a proper fresh load.
+- Bug 4 (the serious one): adding a manager pushes onto `state.managers` and saves — completely correct *if* that list was accurate. If it was actually a stale, incomplete leftover from an earlier session, the save's "here's everything I have" data legitimately looked like every other manager had been deleted, and the server's merge logic (which exists specifically to protect against silent data loss) faithfully did what it was told: removed what wasn't in that stale list. The server-side logic was working as designed — the bug was in what the client believed the truth was.
+
+**Fix**: the session token now persists in `localStorage`, so a refresh
+keeps you logged in and just re-loads data fresh (fixing bug 3 directly).
+`logout()` now does a full page reload instead of a partial reset —
+guaranteeing every single piece of state starts genuinely clean for
+whoever logs in next, on the same device or a different one (fixing 1, 2,
+and 4 all at once, since there's no longer any way for state to survive
+between sessions). The server already independently re-validates the
+token's expiry on every request regardless, so none of this changes the
+actual security boundary — it's purely about not trusting stale
+client-side memory across logins. 7 new tests, including round-tripping a
+real token from the server's own signing function.
+
+67/67 tests passing (20 backend + 12 client-server e2e + 6 login + 7 nav +
+6 date-input + 4 layout + 5 dispatch-filter + 7 session), plus the no-undef
+lint check.
