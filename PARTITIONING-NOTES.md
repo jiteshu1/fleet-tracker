@@ -202,3 +202,65 @@ real token from the server's own signing function.
 67/67 tests passing (20 backend + 12 client-server e2e + 6 login + 7 nav +
 6 date-input + 4 layout + 5 dispatch-filter + 7 session), plus the no-undef
 lint check.
+
+## Security audit round (this drop) — Tier 1: fixed, tested, no business decisions needed
+
+A very long external (ChatGPT-generated) bug list was reviewed — NOT trusted
+at face value, each claim checked against the actual code first. Below are
+the ones independently confirmed real and fixed this round. 84/84 tests
+passing total, all new fixes covered by dedicated tests.
+
+1. **CRITICAL — a non-admin could take over ANY account, including admin's.**
+   The self-service "change my password" endpoint only checked that OTHER
+   users' `name`+`role` were unchanged — it never looked at their
+   `password` field at all. A crafted request could include a fresh
+   password for someone else's account and it would be hashed and applied.
+   Combined with a second gap — the caller's OWN record had no checks
+   at all — a non-admin could also simply set `role: "admin"` for
+   themselves. Both are fixed: a non-admin can now only ever change their
+   own password; every other field of their own record, and every field
+   (including password) of anyone else's record, must match exactly what's
+   already stored.
+
+2. **`trucks`, `drivers`, `managers` had no server-side permission check at
+   all.** The UI only lets admin edit drivers/managers, and only lets a
+   driver/manager edit their own truck/fleet — but a direct API call could
+   bypass that entirely and overwrite any of these for any role. Fixed:
+   drivers/managers are now admin-only server-side; trucks now enforces the
+   same ownership rule the UI already implies (driver: only their own
+   assigned vehicle, based on the database's current record — not
+   whatever the request claims, so a truck can't be "claimed" by editing
+   its driver field; manager: only vehicles in their own fleet, per the
+   managers list on file).
+
+3. **A failed database read was silently treated as "no data exists."**
+   If a Supabase read failed for any transient reason mid-save, the code
+   proceeded as if the dataset were empty, which could let a save wipe out
+   real records that simply couldn't be read a moment before — and would
+   have fooled the wipe-guard too, since it also computed "0 existing
+   records" from the same false-empty read. Now a failed read aborts the
+   whole request with a clean error; nothing is ever written on top of an
+   assumed-empty dataset.
+
+4. **The service worker was caching every API response**, including
+   authenticated, per-user financial/RTGS data — directly contradicting
+   its own comment ("does not cache app data") and the API's `no-store`
+   header. If the network ever failed, a stale or wrong-user cached API
+   response could be served back instead of a fresh authenticated request.
+   Fixed: `/api/` requests are now completely excluded from the service
+   worker (network-only, exactly as if the service worker didn't exist for
+   them), and old cache versions are now deleted on activation so this
+   takes effect immediately for anyone who already has the app installed.
+
+## What's still open (not done this round)
+The external list had 350+ items total. A representative, high-severity
+sample across every category was independently verified against the real
+code (not assumed correct); many of the ones above turned out to be real,
+some turned out to be non-issues or intentional design choices already
+decided earlier in this project (e.g. route/party profit ranking by
+revenue only, on purpose). Still open, roughly in priority order:
+- Server-side duplicate-name/Login ID enforcement (currently UI-only) for users, companies, branches, drivers, managers.
+- Tightening CORS to the app's actual domain(s) instead of `*` (lower urgency for a Bearer-token API, since — unlike cookies — a browser won't automatically attach the token for a cross-origin site to exploit this).
+- Login rate-limiting / brute-force protection.
+- Reconciling the different profit formulas used across dashboards (Vehicle Profit vs Route Profit vs Own Fleet Profit) into one agreed definition — **this needs your input on what should count** (Driver Advance, Commission, Charges, TDS — which belong in "profit"?) before anything gets changed, since dashboards currently disagree with each other rather than one of them being objectively wrong.
+- A handful of calculation-consistency and edge-case items (mileage averaging method, empty-KM at date-range boundaries, negative-value validation) — real, but not security- or data-loss-critical, and several depend on the same profit-formula decision above.

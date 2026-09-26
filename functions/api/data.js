@@ -80,7 +80,7 @@ import { verify, getBearerToken, hashPasswordSalted, jsonResponse, preflightResp
 
 const PARTITIONED_DATASETS = ["trips", "expenses", "rtgs_entries", "branch_expenses"];
 
-const ADMIN_ONLY_KEYS = ["users", "company_logo", "gps_sync_url", "branches", "rtgs_entries", "companies", "branch_expenses", "partition_status"];
+const ADMIN_ONLY_KEYS = ["users", "company_logo", "gps_sync_url", "branches", "rtgs_entries", "companies", "branch_expenses", "partition_status", "drivers", "managers"];
 const KNOWN_KEYS = ["users", "trucks", "drivers", "managers", "trips", "expenses", "company_logo", "gps_sync_url", "photos", "branches", "rtgs_entries", "companies", "branch_expenses", "partition_status"];
 
 const COMPANY_WRITABLE_KEYS = ["trips", "expenses", "rtgs_entries", "branch_expenses"];
@@ -231,7 +231,18 @@ async function setup(context) {
     const r = await fetch(SUPABASE_URL + "/rest/v1/app_data?key=eq." + encodeURIComponent(key) + "&select=value", {
       headers: { "apikey": SERVICE_KEY, "Authorization": "Bearer " + SERVICE_KEY }
     });
-    if (!r.ok) return null;
+    if (!r.ok) {
+      // A failed read must NEVER be silently treated as "no data exists" —
+      // every caller does `curVal ? JSON.parse(curVal) : []`, so a
+      // transient database error masquerading as an empty dataset could
+      // let a subsequent merge+write wipe out real records that simply
+      // couldn't be read a moment ago (and would also fool the wipe-guard
+      // below, since it would compute curCount=0 from the same false
+      // "empty" read). Throwing here aborts the whole request instead —
+      // it's caught by the outer try/catch and turned into a clean error
+      // response, with nothing written.
+      throw new Error("Database read failed for '" + key + "' (status " + r.status + ").");
+    }
     const rows = await r.json();
     return rows.length ? rows[0].value : null;
   }
@@ -397,21 +408,34 @@ export async function onRequestPost(context) {
       try { incoming = JSON.parse(value); } catch (e) { return jsonResponse({ error: "Malformed users data." }, 400); }
       let rejectShortPassword = null;
 
-      const curRes = await fetch(SUPABASE_URL + "/rest/v1/app_data?key=eq.users&select=value", {
-        headers: { "apikey": SERVICE_KEY, "Authorization": "Bearer " + SERVICE_KEY }
-      });
-      const curRows = curRes.ok ? await curRes.json() : [];
-      const current = curRows.length ? JSON.parse(curRows[0].value) : [];
+      const curValUsers = await fetchRow("users");
+      const current = curValUsers ? JSON.parse(curValUsers) : [];
       const currentByName = {};
       current.forEach(function (u) { currentByName[u.name.toLowerCase()] = u; });
 
       if (session.role !== "admin") {
+        // A non-admin may ONLY change their own password — nothing else,
+        // for themselves or anyone else. This used to only compare
+        // name+role for OTHER users (silently ignoring their loginId,
+        // mustChangePassword, and — critically — their password field),
+        // and skipped every check on the caller's OWN record entirely.
+        // Together those meant a non-admin could: (a) send {role:"admin"}
+        // for themselves and it would be accepted, and (b) include a fresh
+        // plaintext password for ANY other user's record — including
+        // admin's — and it would be hashed and applied, since nothing here
+        // ever looked at u.password for a record that wasn't the caller's
+        // own. That second one is a full account-takeover path, not just a
+        // privilege-escalation one.
         const onlySelfChanged = incoming.every(function (u) {
-          const key2 = u.name.toLowerCase();
+          const key2 = String(u.name || "").toLowerCase();
           const existing = currentByName[key2];
-          if (key2 !== session.name.toLowerCase()) {
-            return existing && existing.name === u.name && existing.role === u.role;
-          }
+          if (!existing) return false; // a non-admin can't add or rename users
+          const isSelf = key2 === session.name.toLowerCase();
+          const nonPasswordFieldsMatch = existing.name === u.name && existing.role === u.role &&
+            (u.loginId || "") === (existing.loginId || "") &&
+            !!u.mustChangePassword === !!existing.mustChangePassword;
+          if (!nonPasswordFieldsMatch) return false;
+          if (!isSelf && typeof u.password === "string" && u.password) return false; // never allowed to set anyone else's password
           return true;
         });
         const sameCount = incoming.length === current.length;
@@ -561,6 +585,37 @@ export async function onRequestPost(context) {
             const companyId = await resolveCompanyId();
             inScopeFn = function (r) { return !!companyId && r.companyId === companyId; };
             scopeErrorMsg = "You can only add or change expenses for your own company's branches.";
+          }
+        } else if (key === "trucks" && session.role !== "admin") {
+          // Previously trucks had NO server-side ownership check at all —
+          // any authenticated non-admin role (driver, manager, branch,
+          // viewer) could overwrite the entire fleet via a direct API
+          // call, even though the UI only ever lets a driver touch their
+          // own truck and a manager touch their own fleet. This mirrors
+          // the client's own canEditTruck() rule, server-side. (Company
+          // logins are already rejected earlier, above, since "trucks"
+          // isn't in COMPANY_WRITABLE_KEYS.)
+          if (session.role === "driver") {
+            // Ownership must come from the CURRENT database state, not
+            // from whatever the caller submits — otherwise a driver could
+            // "claim" someone else's truck simply by setting its
+            // driverName to their own name in the payload they're sending.
+            const ownedIds = {};
+            (freshCurrent || []).forEach(function (t) {
+              if (t.driverName && t.driverName.toLowerCase() === session.name.toLowerCase()) ownedIds[t.id] = true;
+            });
+            inScopeFn = function (r) { return !!ownedIds[r.id]; };
+            scopeErrorMsg = "You can only change the vehicle assigned to you.";
+          } else if (session.role === "manager") {
+            const managersVal = await fetchRow("managers");
+            const managers = managersVal ? JSON.parse(managersVal) : [];
+            const mgr = managers.find(function (m) { return m.name === session.name; });
+            const ownedIds = {};
+            ((mgr && mgr.vehicleIds) || []).forEach(function (id) { ownedIds[id] = true; });
+            inScopeFn = function (r) { return !!ownedIds[r.id]; };
+            scopeErrorMsg = "You can only change vehicles in your own fleet.";
+          } else {
+            return jsonResponse({ error: "Only an admin, driver, or manager login can change this." }, 403);
           }
         }
 
