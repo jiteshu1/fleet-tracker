@@ -264,3 +264,38 @@ revenue only, on purpose). Still open, roughly in priority order:
 - Login rate-limiting / brute-force protection.
 - Reconciling the different profit formulas used across dashboards (Vehicle Profit vs Route Profit vs Own Fleet Profit) into one agreed definition — **this needs your input on what should count** (Driver Advance, Commission, Charges, TDS — which belong in "profit"?) before anything gets changed, since dashboards currently disagree with each other rather than one of them being objectively wrong.
 - A handful of calculation-consistency and edge-case items (mileage averaging method, empty-KM at date-range boundaries, negative-value validation) — real, but not security- or data-loss-critical, and several depend on the same profit-formula decision above.
+
+## CRITICAL — the real "adding a manager deletes all others" bug, found and fixed
+This was reported multiple times and initially misdiagnosed as a stale-
+session issue (that WAS a real, separate bug, already fixed — but it
+wasn't this one). Confirmed via a live Supabase screenshot: `drivers` had
+collapsed to exactly one entry, and `drivers_prev` (the automatic backup)
+showed three different, real drivers from before. Same pattern for
+`managers`.
+
+**Root cause**: `drivers`, `managers`, and `branches` all use `name` as
+their natural identity — none of them have an `id` field. But the server's
+merge function (`scopedMerge`) defaulted to identifying every record by
+`.id` when no other key was specified. Since `.id` is `undefined` for
+every driver/manager/branch, they all collapsed into the exact same
+internal map slot — so a save could only ever "see" one record per
+dataset (whichever was last in the array), and every other one looked, to
+the merge logic, like it had been deleted. This is why it happened
+consistently, every single time, regardless of fresh login — it had
+nothing to do with session staleness. `trips`, `trucks`, `rtgs_entries`,
+`companies`, and `branch_expenses` all do have a real `id` field and were
+never affected.
+
+**Fix**: `scopedMerge` now uses `name` as the identity specifically for
+drivers/managers/branches, matching what they actually are. 5 new tests
+lock this in directly, including the exact reported scenario (add a
+driver, confirm the others survive) and edit/delete cases for the same
+three datasets.
+
+**Your existing drivers were not permanently lost** — the automatic
+backup (`drivers_prev` in Supabase) still has them. After deploying this
+fix, you can re-add Masood 2607, Zulfikar 2614, and Ashrif 2667 (or any
+other driver this happened to) through the app normally; from then on
+they'll all correctly coexist.
+
+89/89 tests passing total.

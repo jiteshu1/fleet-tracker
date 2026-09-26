@@ -220,6 +220,101 @@ test("branch and viewer roles cannot write trucks at all", async () => {
   assert.equal(r.status, 403);
 });
 
+test("CRITICAL (now fixed) — the actual bug reported: adding a new driver no longer deletes every other driver", async () => {
+  const mock = createMockSupabase(BASE_URL);
+  globalThis.fetch = mock.fetch;
+  const adminTok = token("Admin", "admin");
+
+  // Three real drivers already exist (matching the reported scenario).
+  await POST({ key: "drivers", value: JSON.stringify([
+    { name: "Masood 2607", contact: "+91 91031 69371", managerName: "Mohit Sharma Tempo" },
+    { name: "Zulfikar 2614", contact: "+91 80828 57122", managerName: "Mohit Sharma Tempo" },
+    { name: "Ashrif 2667", contact: "+91 60063 93561", managerName: "Mohit Sharma Tempo" }
+  ]), baseline: JSON.stringify([]) }, adminTok, env);
+
+  // Admin adds a brand new fourth driver — this is the exact "add manager/driver" flow.
+  const before = JSON.parse(mock._get("drivers"));
+  const afterAdd = before.concat([{ name: "Wazir 2158", contact: "+91 88996 90423", managerName: "Mohit Sharma Translines" }]);
+  const res = await POST({ key: "drivers", value: JSON.stringify(afterAdd), baseline: JSON.stringify(before) }, adminTok, env);
+
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const finalDrivers = JSON.parse(mock._get("drivers"));
+  assert.equal(finalDrivers.length, 4, "all three original drivers plus the new one must all survive");
+  assert.deepEqual(finalDrivers.map(d => d.name).sort(), ["Ashrif 2667", "Masood 2607", "Wazir 2158", "Zulfikar 2614"]);
+});
+
+test("CRITICAL (now fixed) — same bug, same fix, for managers", async () => {
+  const mock = createMockSupabase(BASE_URL);
+  globalThis.fetch = mock.fetch;
+  const adminTok = token("Admin", "admin");
+
+  await POST({ key: "managers", value: JSON.stringify([
+    { name: "Mohit Sharma Tempo", contact: "", vehicleIds: ["T1"] },
+    { name: "Mohit Sharma Translines", contact: "", vehicleIds: ["T2"] }
+  ]), baseline: JSON.stringify([]) }, adminTok, env);
+
+  const before = JSON.parse(mock._get("managers"));
+  const afterAdd = before.concat([{ name: "Suresh Kumar Fleet", contact: "", vehicleIds: [] }]);
+  const res = await POST({ key: "managers", value: JSON.stringify(afterAdd), baseline: JSON.stringify(before) }, adminTok, env);
+
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const finalManagers = JSON.parse(mock._get("managers"));
+  assert.equal(finalManagers.length, 3);
+  assert.deepEqual(finalManagers.map(m => m.name).sort(), ["Mohit Sharma Tempo", "Mohit Sharma Translines", "Suresh Kumar Fleet"]);
+});
+
+test("same fix for branches (also name-keyed, not yet triggered live but the same bug applies)", async () => {
+  const mock = createMockSupabase(BASE_URL);
+  globalThis.fetch = mock.fetch;
+  const adminTok = token("Admin", "admin");
+
+  await POST({ key: "branches", value: JSON.stringify([
+    { name: "AGRA", contact: "" }, { name: "AHMEDABAD", contact: "" }, { name: "ALWAR", contact: "" }
+  ]), baseline: JSON.stringify([]) }, adminTok, env);
+
+  const before = JSON.parse(mock._get("branches"));
+  const afterAdd = before.concat([{ name: "AMBALA", contact: "" }]);
+  const res = await POST({ key: "branches", value: JSON.stringify(afterAdd), baseline: JSON.stringify(before) }, adminTok, env);
+
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(JSON.parse(mock._get("branches")).length, 4);
+});
+
+test("editing (not adding) one driver among several still only changes that one — the rest stay untouched", async () => {
+  const mock = createMockSupabase(BASE_URL);
+  globalThis.fetch = mock.fetch;
+  const adminTok = token("Admin", "admin");
+  await POST({ key: "drivers", value: JSON.stringify([
+    { name: "Masood 2607", contact: "old-number" },
+    { name: "Zulfikar 2614", contact: "111" }
+  ]), baseline: JSON.stringify([]) }, adminTok, env);
+
+  const before = JSON.parse(mock._get("drivers"));
+  const edited = before.map(d => d.name === "Masood 2607" ? Object.assign({}, d, { contact: "new-number" }) : d);
+  const res = await POST({ key: "drivers", value: JSON.stringify(edited), baseline: JSON.stringify(before) }, adminTok, env);
+  assert.equal(res.status, 200);
+  const final = JSON.parse(mock._get("drivers"));
+  assert.equal(final.length, 2);
+  assert.equal(final.find(d => d.name === "Masood 2607").contact, "new-number");
+  assert.equal(final.find(d => d.name === "Zulfikar 2614").contact, "111");
+});
+
+test("deleting one driver among several removes only that one", async () => {
+  const mock = createMockSupabase(BASE_URL);
+  globalThis.fetch = mock.fetch;
+  const adminTok = token("Admin", "admin");
+  await POST({ key: "drivers", value: JSON.stringify([
+    { name: "Masood 2607" }, { name: "Zulfikar 2614" }, { name: "Ashrif 2667" }
+  ]), baseline: JSON.stringify([]) }, adminTok, env);
+
+  const before = JSON.parse(mock._get("drivers"));
+  const afterDelete = before.filter(d => d.name !== "Zulfikar 2614");
+  const res = await POST({ key: "drivers", value: JSON.stringify(afterDelete), baseline: JSON.stringify(before) }, adminTok, env);
+  assert.equal(res.status, 200);
+  const final = JSON.parse(mock._get("drivers"));
+  assert.deepEqual(final.map(d => d.name).sort(), ["Ashrif 2667", "Masood 2607"]);
+});
+
 // ---------------------------------------------------------------------
 let pass = 0, fail = 0;
 for (const t of tests) {

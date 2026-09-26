@@ -619,7 +619,18 @@ export async function onRequestPost(context) {
           }
         }
 
-        const r = scopedMerge(freshCurrent, baseline, incoming, inScopeFn);
+        // drivers/branches/managers use `name` as their natural identity —
+        // they were never given an `id` field. scopedMerge's default idFn
+        // assumes `.id`, which is undefined for all of them alike, so
+        // EVERY record collapsed into the same single map slot and only
+        // the last one in the array ever survived a save — exactly the
+        // "adding one manager deletes all the others" bug. Trips/trucks/
+        // rtgs_entries/companies/branch_expenses all do have a real `id`
+        // and are unaffected; this only needs to override it for the
+        // three that don't.
+        const NAME_KEYED_RECORD_TYPES = { drivers: true, managers: true, branches: true };
+        const idFn = NAME_KEYED_RECORD_TYPES[key] ? function (r) { return r && r.name; } : undefined;
+        const r = scopedMerge(freshCurrent, baseline, incoming, inScopeFn, idFn);
         if (!r.ok) return jsonResponse({ error: scopeErrorMsg }, 403);
         value = JSON.stringify(r.merged);
       }
